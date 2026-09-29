@@ -736,16 +736,8 @@ FIELD_MAP = {
     "mash":        "mash_change_pct",
     "alt":         "alt_reduction_pct",
 }
-# Maps endpoint name → eval confidence column for that endpoint
-EVAL_CONFIDENCE_MAP = {
-    "weight_loss": "eval_weight_confidence",
-    "hba1c":       "eval_hba1c_confidence",
-    "mash":        "eval_mash_confidence",
-    "alt":         "eval_alt_confidence",
-}
-# Minimum eval confidence to include an endpoint value in scoring
-HIGH_EVAL_THRESHOLD = 0.8
-PHASE_PENALTY = {3: 1.00, 2: 0.85, 1: 0.65}
+# Phase 4 (post-marketing) is treated the same as Phase 3 — no penalty.
+PHASE_PENALTY = {4: 1.00, 3: 1.00, 2: 0.85, 1: 0.65}
 
 
 def _parse_phase(raw) -> Optional[int]:
@@ -783,43 +775,56 @@ def _pct_to_score(pct: float) -> int:
     return 1
 
 
-def _score_endpoint(
+def _collect_endpoint_rows(
     trials: List[Dict[str, str]],
     value_field: str,
-    eval_confidence_field: Optional[str] = None,
-) -> Dict[str, Any]:
-    valid = []
-    skipped_low_conf = 0
+    require_size: bool,
+) -> List[Dict[str, Any]]:
+    """Gather trials with a usable phase + value for this endpoint.
+
+    When require_size is True, a trial also needs a parseable trial_size > 0
+    to qualify. This is relaxed (require_size=False) as a fallback when no
+    trial clears that bar, so an endpoint doesn't end up with no data purely
+    because trial_size is missing.
+    """
+    out = []
     for t in trials:
-        phase    = _parse_phase(t.get("phase"))
-        value    = _parse_float(t.get(value_field))
-        n        = _parse_float(t.get("trial_size")) or 0
-        trial_id = t.get("trial_id") or t.get("Trial ID")
-        if phase is None or value is None or n <= 0:
+        phase = _parse_phase(t.get("phase"))
+        value = _parse_float(t.get(value_field))
+        if phase is None or value is None:
             continue
-        # Filter by eval confidence if the field is available
-        if eval_confidence_field:
-            try:
-                eval_conf = float(t.get(eval_confidence_field) or 0)
-            except (ValueError, TypeError):
-                eval_conf = 0.0
-            if eval_conf < HIGH_EVAL_THRESHOLD:
-                skipped_low_conf += 1
-                continue
-        if not trial_id:
-            trial_id = f"__unknown_{id(t)}"
-        valid.append({"phase": phase, "value": value, "n": n, "trial_id": trial_id, "full_trial": t})
+        n = _parse_float(t.get("trial_size")) or 0
+        if require_size and n <= 0:
+            continue
+        trial_id = t.get("trial_id") or t.get("Trial ID") or f"__unknown_{id(t)}"
+        out.append({"phase": phase, "value": value, "n": n, "trial_id": trial_id, "full_trial": t})
+    return out
+
+
+def _score_endpoint(trials: List[Dict[str, str]], value_field: str) -> Dict[str, Any]:
+    """Score a single endpoint (e.g. weight loss) across a molecule's trials.
+
+    Selection rule: prefer Phase 4/3 data over Phase 2 over Phase 1. Within
+    the highest available phase, dedupe multiple rows for the same trial_id
+    (keep each trial's best arm), then take the single highest value among
+    the deduped trials. There is no confidence-based filtering — any row
+    with a parseable phase and value is eligible.
+
+    If no trial has a usable trial_size, we fall back to picking from
+    whichever trial has data at the highest available phase, ignoring size.
+    """
+    valid = _collect_endpoint_rows(trials, value_field, require_size=True)
+    used_fallback = False
+    if not valid:
+        valid = _collect_endpoint_rows(trials, value_field, require_size=False)
+        used_fallback = True
 
     if not valid:
-        reason = (
-            f"No valid data for this endpoint"
-            + (f" ({skipped_low_conf} skipped: eval confidence < {HIGH_EVAL_THRESHOLD})"
-               if skipped_low_conf else "")
-        )
         return {"best_value": None, "raw_value": None, "phase_used": None,
-                "penalty": 1.0, "score": None, "trial_details": {}, "reason": reason}
+                "penalty": 1.0, "score": None, "trial_details": {},
+                "reason": "No valid data for this endpoint"}
 
-    for target_phase in (3, 2, 1):
+    for target_phase in (4, 3, 2, 1):
         phase_trials = [r for r in valid if r["phase"] == target_phase]
         if not phase_trials:
             continue
@@ -832,6 +837,9 @@ def _score_endpoint(
         pen  = PHASE_PENALTY[target_phase]
         adj  = raw * pen
         ft   = best.get("full_trial", {})
+        reason = f"Phase {target_phase} data used" + (f" (x{pen} penalty applied)" if pen < 1 else "")
+        if used_fallback:
+            reason += " [fallback: no trial had a usable trial_size]"
         return {
             "best_value":  round(adj, 4),
             "raw_value":   round(raw, 4),
@@ -846,7 +854,7 @@ def _score_endpoint(
                 "mash_duration":   ft.get("mash_duration", "N/A"),
                 "alt_duration":    ft.get("alt_duration", "N/A"),
             },
-            "reason": f"Phase {target_phase} data used" + (f" (x{pen} penalty applied)" if pen < 1 else ""),
+            "reason": reason,
         }
 
     return {"best_value": None, "raw_value": None, "phase_used": None,
@@ -856,7 +864,7 @@ def _score_endpoint(
 def compute_clinical_efficacy_score(molecule: str, rows: List[Dict[str, str]]) -> Dict[str, Any]:
     total = len(rows)
     endpoint_results = {
-        ep: _score_endpoint(rows, field, EVAL_CONFIDENCE_MAP.get(ep))
+        ep: _score_endpoint(rows, field)
         for ep, field in FIELD_MAP.items()
     }
 

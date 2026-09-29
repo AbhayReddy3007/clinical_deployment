@@ -72,18 +72,34 @@ def _pct_to_score(pct: float) -> int:
     return 1
 
 
-def score_endpoint(trials: List[Dict[str, Any]], value_field: str) -> dict:
-    """Score a single endpoint. Prefer Phase 3, fall back to 2 then 1."""
+def _collect_valid(trials: List[Dict[str, Any]], value_field: str, require_size: bool) -> list:
     valid = []
     for t in trials:
         phase = _parse_phase(t.get("phase"))
         value = _parse_float(t.get(value_field))
-        size = _parse_float(t.get("trial_size")) or 0
-        tid = t.get("trial_id", "")
-        if phase is None or value is None or size <= 0:
+        if phase is None or value is None:
             continue
+        size = _parse_float(t.get("trial_size")) or 0
+        if require_size and size <= 0:
+            continue
+        tid = t.get("trial_id", "")
         valid.append({"phase": phase, "value": value, "n": size,
                       "trial_id": tid, "dosage": t.get("dosage", "N/A")})
+    return valid
+
+
+def score_endpoint(trials: List[Dict[str, Any]], value_field: str) -> dict:
+    """Score a single endpoint. Prefer Phase 3, fall back to 2 then 1.
+
+    No confidence-based filtering is applied — any row with a parseable
+    phase and value is eligible. If no trial has a usable trial_size, fall
+    back to the trial at the highest available phase regardless of size.
+    """
+    valid = _collect_valid(trials, value_field, require_size=True)
+    used_fallback = False
+    if not valid:
+        valid = _collect_valid(trials, value_field, require_size=False)
+        used_fallback = True
 
     if not valid:
         return {"score": None, "raw_value": None, "best_value": None,
@@ -102,6 +118,9 @@ def score_endpoint(trials: List[Dict[str, Any]], value_field: str) -> dict:
         best = max(deduped, key=lambda r: r["value"])
         pen = PHASE_PENALTY[target]
         adj = best["value"] * pen
+        reason = f"Phase {target}" + (f" (x{pen})" if pen < 1 else "")
+        if used_fallback:
+            reason += " [fallback: no trial had a usable trial_size]"
         return {
             "score": _pct_to_score(adj),
             "raw_value": round(best["value"], 2),
@@ -110,7 +129,7 @@ def score_endpoint(trials: List[Dict[str, Any]], value_field: str) -> dict:
             "penalty": pen,
             "trial_id": best["trial_id"],
             "dosage": best["dosage"],
-            "reason": f"Phase {target}" + (f" (x{pen})" if pen < 1 else ""),
+            "reason": reason,
         }
 
     return {"score": None, "raw_value": None, "best_value": None,
